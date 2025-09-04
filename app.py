@@ -1,214 +1,346 @@
-import os, json, time, datetime as dt
-from typing import List, Dict, Any, Optional
+# app.py
+import os
+import time
+import math
+import json
+import asyncio
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from typing import Dict, List, Any, Optional
 
 import requests
 import pandas as pd
-import numpy as np
-from fastapi import FastAPI, BackgroundTasks, Body, HTTPException
+from fastapi import FastAPI, Response
+from fastapi.responses import PlainTextResponse, JSONResponse
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
-# ================== CONFIG ==================
-# Gắn trực tiếp BOT_TOKEN & CHAT_ID của anh
-BOT_TOKEN  = os.getenv("BOT_TOKEN", "8207349630:AAFQ1Sq8eumEtNoNNSg4DboQ-SMzBLui95o")
-CHAT_ID    = os.getenv("CHAT_ID", "5614513021")
+# =========================
+# Config & constants
+# =========================
+TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
-def env_json(name: str, default: Any) -> Any:
-    raw = os.getenv(name)
-    if not raw:
-        return default
+DEFAULT_TICKERS = [
+    "VPB", "MBB", "TCB", "CTG", "DCM", "KDH",
+    "HPG", "VHM", "VIX", "DDV", "BSR", "POW",
+    "REE", "GMD", "VNM", "MWG"
+]
+
+TOKEN = os.getenv("TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
+
+# pivots
+try:
+    PIVOTS: Dict[str, float] = json.loads(os.getenv("PIVOTS_JSON", "{}"))
+except Exception:
+    PIVOTS = {}
+
+# plans (targets/SL)
+try:
+    PLAN: Dict[str, Dict[str, float]] = json.loads(os.getenv("PLAN_JSON", "{}"))
+except Exception:
+    PLAN = {}
+
+TICKERS = [x.strip().upper() for x in os.getenv("TICKERS", "").split(",") if x.strip()] or DEFAULT_TICKERS
+SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
+TRADING_MIN_PER_DAY = int(os.getenv("TRADING_MIN_PER_DAY", "270"))
+
+# VNDirect DChart endpoints
+DCHART_URL = "https://dchart-api.vndirect.com.vn/dchart/history"
+
+# memory to avoid duplicate alerts per day
+sent_today: Dict[str, str] = {}  # {symbol: "YYYY-MM-DD"}
+
+app = FastAPI(title="VN21 Scanner", version="1.0")
+
+
+# =========================
+# Utils
+# =========================
+def now_ts() -> int:
+    return int(datetime.now(tz=TZ).timestamp())
+
+def hs(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=TZ).strftime("%H:%M")
+
+def get_plan_levels(sym: str, ref_price: float) -> Dict[str, float]:
+    """Return T1/T2/SL for symbol, fallback to % levels from ref_price."""
+    plan = PLAN.get(sym, {})
+    if {"t1", "t2", "sl"} <= set(plan.keys()):
+        return {"t1": float(plan["t1"]), "t2": float(plan["t2"]), "sl": float(plan["sl"])}
+    # fallback: +3% / +6% / -3% từ pivot hoặc giá gần nhất
+    base = PIVOTS.get(sym, ref_price)
+    return {
+        "t1": round(base * 1.03, 3),
+        "t2": round(base * 1.06, 3),
+        "sl": round(base * 0.97, 3),
+    }
+
+def telegram_send(text: str) -> None:
+    if not (TOKEN and CHAT_ID):
+        return
     try:
-        return json.loads(raw)
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=10)
     except Exception:
-        return default
+        pass
 
-PLAN       = env_json("PLAN_JSON", {})
-PIVOTS     = env_json("PIVOTS_JSON", {})
-ACCOUNT_VALUE = float(os.getenv("ACCOUNT_VALUE", "30000000"))
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
-RESOLUTION = os.getenv("RESOLUTION", "5")   # "5" = 5m, "D" = daily
 
-# ================== FASTAPI APP ==================
-app = FastAPI(title="VN21 Scanner PRO-FULL", version="2.0.0")
-
-# ================== HELPERS ==================
-def tg_send(text: str) -> Optional[Dict[str, Any]]:
-    if not (BOT_TOKEN and CHAT_ID):
-        return None
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=10)
-        if r.ok:
-            return r.json()
-    except Exception as e:
-        print("Telegram error:", e)
-    return None
-
-def format_signal(sym: str, msg: str) -> str:
-    return f"📡 {sym} — {msg}"
-
-# ================== FETCH DATA ==================
-def fetch_ohlcv(symbol: str, resolution=RESOLUTION, days_back=120):
-    now = dt.datetime.now()
-    frm = int((now - dt.timedelta(days=days_back)).timestamp())
-    to  = int(now.timestamp())
-    url = "https://dchart-api.vndirect.com.vn/dchart/history"
-    r = requests.get(url, params={
+# =========================
+# Data fetchers (VNDirect)
+# =========================
+def fetch_intraday_5m(symbol: str, days: int = 2) -> pd.DataFrame:
+    """
+    Lấy nến 5m trong N ngày gần nhất từ DChart.
+    Trả về DataFrame: t (epoch), o,h,l,c,v
+    """
+    to_ts = now_ts()
+    from_ts = to_ts - days * 86400
+    params = {
         "symbol": symbol,
-        "resolution": resolution,
-        "from": frm,
-        "to": to
-    }, timeout=15)
+        "resolution": "5",
+        "from": from_ts,
+        "to": to_ts,
+    }
+    r = requests.get(DCHART_URL, params=params, timeout=15)
     r.raise_for_status()
-    js = r.json()
-    if not js or "t" not in js or not js["t"]:
-        return None
+    data = r.json()
+    if data.get("s") != "ok":
+        return pd.DataFrame()
     df = pd.DataFrame({
-        "t": [dt.datetime.fromtimestamp(x) for x in js["t"]],
-        "o": js["o"], "h": js["h"], "l": js["l"], "c": js["c"], "v": js["v"]
+        "t": data.get("t", []),
+        "o": data.get("o", []),
+        "h": data.get("h", []),
+        "l": data.get("l", []),
+        "c": data.get("c", []),
+        "v": data.get("v", []),
     })
     return df
 
-# ================== CORE LOGIC ==================
-last_alert_time = {}  # cooldown
-latest_alerts: List[str] = []
+def fetch_daily(symbol: str, days: int = 40) -> pd.DataFrame:
+    """Lấy nến D để tính vol trung bình 20 ngày."""
+    to_ts = now_ts()
+    from_ts = to_ts - days * 86400
+    params = {
+        "symbol": symbol,
+        "resolution": "D",
+        "from": from_ts,
+        "to": to_ts,
+    }
+    r = requests.get(DCHART_URL, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("s") != "ok":
+        return pd.DataFrame()
+    df = pd.DataFrame({
+        "t": data.get("t", []),
+        "o": data.get("o", []),
+        "h": data.get("h", []),
+        "l": data.get("l", []),
+        "c": data.get("c", []),
+        "v": data.get("v", []),
+    })
+    return df
 
-def scan_symbols(symbols: List[str]) -> List[str]:
-    alerts = []
 
-    # Market bias theo VNIndex
-    vnindex_df = fetch_ohlcv("VNINDEX", "D", 120)
-    market_bias = "Bull"
-    if vnindex_df is not None and len(vnindex_df) >= 50:
-        ma50_idx = vnindex_df["c"].rolling(50).mean().iloc[-1]
-        if vnindex_df["c"].iloc[-1] < ma50_idx:
-            market_bias = "Bear"
+# =========================
+# Indicators / models
+# =========================
+def avg_per_minute_volume_20d(symbol: str) -> Optional[float]:
+    """
+    Ước lượng vol trung bình mỗi phút dựa trên vol trung bình 20 phiên (nến D).
+    """
+    dfd = fetch_daily(symbol, days=60)
+    if dfd.empty:
+        return None
+    dfd = dfd.tail(20)
+    if dfd.empty:
+        return None
+    avg_daily_vol = float(pd.to_numeric(dfd["v"], errors="coerce").dropna().mean())
+    if avg_daily_vol <= 0:
+        return None
+    return avg_daily_vol / max(TRADING_MIN_PER_DAY, 1)
 
-    for sym in symbols:
-        pivot = PIVOTS.get(sym.upper(), None)
-        plan  = PLAN.get(sym.upper(), {})
+def wick_ok(o: float, h: float, l: float, c: float) -> bool:
+    """Không có bóng trên dài >60% thân nến."""
+    body = abs(c - o)
+    upper = h - max(o, c)
+    # nếu thân quá nhỏ, cho phép upper nhỏ hơn 0.2% giá
+    if body < 1e-4:
+        return upper <= 0.002 * c
+    return upper <= 0.6 * body
 
+def detect_darvas_box(df5: pd.DataFrame, lookback_bars: int = 60) -> Optional[Dict[str, float]]:
+    """
+    Darvas Box đơn giản: tìm hộp gần nhất trong lookback.
+    Trả về {top, bottom} nếu phát hiện.
+    """
+    if df5.empty:
+        return None
+    seg = df5.tail(lookback_bars)
+    high = float(seg["h"].max())
+    low = float(seg["l"].min())
+    if math.isfinite(high) and math.isfinite(low) and high > low:
+        return {"top": round(high, 3), "bottom": round(low, 3)}
+    return None
+
+def breakout_signal(symbol: str, pivots: Dict[str, float]) -> Optional[str]:
+    """
+    Áp bộ tiêu chí:
+      (1) Close > pivot 2 nến 5m liên tiếp HOẶC close > pivot * 1.01
+      (2) Vol 5m >= 1.5x vol trung bình / phút * 5
+      (3) Wick trên không dài
+    => Nếu đạt, trả về thông điệp cảnh báo 1 dòng; ngược lại trả None.
+    """
+    pivot = float(pivots.get(symbol, 0) or 0)
+    if pivot <= 0:
+        return None
+
+    df5 = fetch_intraday_5m(symbol, days=2)
+    if df5.empty or len(df5) < 3:
+        return None
+
+    # Lấy 2 nến 5m đã hoàn thành (bỏ nến đang chạy)
+    last2 = df5.tail(3).iloc[:2]  # 2 candles trước nến hiện tại
+    c1, c2 = float(last2.iloc[-2]["c"]), float(last2.iloc[-1]["c"])
+    o2, h2, l2 = float(last2.iloc[-1]["o"]), float(last2.iloc[-1]["h"]), float(last2.iloc[-1]["l"])
+    v2 = float(last2.iloc[-1]["v"])
+
+    # Điều kiện (1)
+    cond1 = (c1 > pivot and c2 > pivot) or (c2 >= pivot * 1.01)
+
+    # Điều kiện (2): vol 5m so với MA20 per-minute
+    apm = avg_per_minute_volume_20d(symbol)
+    if apm is None or apm <= 0:
+        return None
+    vol_threshold = 1.5 * apm * 5  # 1.5x mỗi phút * 5 phút
+    cond2 = v2 >= vol_threshold
+
+    # Điều kiện (3): wick
+    cond3 = wick_ok(o2, h2, l2, c2)
+
+    if not (cond1 and cond2 and cond3):
+        return None
+
+    # Model tags (Darvas/CANSLIM/Zanger) — đánh dấu heuristic nhẹ
+    model_tags = []
+    box = detect_darvas_box(df5)
+    if box and c2 > box["top"]:
+        model_tags.append("Darvas")
+    # CANSLIM / Zanger nhãn tham khảo (không đánh giá EPS/RS ở đây)
+    if c2 > pivot * 1.02 and v2 > vol_threshold * 1.3:
+        model_tags.append("Zanger")
+    else:
+        model_tags.append("CANSLIM")
+
+    # Entry/Targets/SL
+    plan = get_plan_levels(symbol, ref_price=c2)
+    entry_low = round(pivot, 3)
+    entry_high = round(c2, 3)
+
+    msg = (
+        f"{symbol} – BUY {entry_low}-{entry_high} | "
+        f"T1: {plan['t1']} | T2: {plan['t2']} | SL: {plan['sl']} | "
+        f"⚡ Breakout xác nhận (vol {int(v2):,} vs ≥{int(vol_threshold):,}; {hs(int(df5.tail(2).iloc[0]['t']))}-{hs(int(df5.tail(2).iloc[1]['t']))}) | "
+        f"Model: {('/'.join(model_tags))}"
+    )
+    return msg
+
+
+# =========================
+# Scanner job
+# =========================
+async def scan_once() -> Dict[str, Any]:
+    results = {"time": datetime.now(tz=TZ).isoformat(), "signals": []}
+    pivots = PIVOTS or {}
+    # nếu thiếu pivot, bỏ qua mã tương ứng
+    for sym in TICKERS:
         try:
-            df = fetch_ohlcv(sym, RESOLUTION, 120)
-            if df is None or len(df) < 60:
+            if sym not in pivots:
                 continue
-
-            price = df["c"].iloc[-1]
-            vol   = df["v"].iloc[-1]
-
-            # ========= INDICATORS =========
-            ma20 = df["c"].rolling(20).mean().iloc[-1]
-            ma50 = df["c"].rolling(50).mean().iloc[-1]
-            ma200 = df["c"].rolling(100).mean().iloc[-1]
-            atr14 = (df["h"] - df["l"]).rolling(14).mean().iloc[-1]
-            rvol = vol / df["v"].rolling(20).mean().iloc[-1]
-
-            perf_3m = (price / df["c"].iloc[-60]) - 1
-            vnindex_perf = 0.05
-            rs = (perf_3m - vnindex_perf) * 100
-
-            lookback = 20
-            box_high = df["h"].iloc[-lookback:].max()
-
-            # ========= CONDITIONS =========
-            cond_vol = rvol >= 1.5
-            cond_trend = ma20 > ma50 > ma200
-            cond_breakout = price > box_high
-            cond_fake = price < box_high * 1.01 or vol < 1.5 * df["v"].rolling(20).mean().iloc[-1]
-            cond_atr = (df["h"].iloc[-1] - df["l"].iloc[-1]) >= 0.5 * atr14
-            cond_rs = rs > 0
-
-            if pivot and cond_vol and cond_trend and cond_breakout and not cond_fake and cond_atr and cond_rs:
-                # Cooldown 10 phút
-                now_ts = time.time()
-                if sym in last_alert_time and now_ts - last_alert_time[sym] < 600:
-                    continue
-                last_alert_time[sym] = now_ts
-
-                t1 = plan.get("t1", round(price + 1*atr14, 2))
-                t2 = plan.get("t2", round(price + 2*atr14, 2))
-                sl = plan.get("sl", round(price - 1*atr14, 2))
-
-                risk_amount = ACCOUNT_VALUE * RISK_PER_TRADE
-                qty = int(risk_amount / max(price - sl, 0.01))
-
-                msg = (
-                    f"{sym} – BUY {round(price,2)} | T1: {t1} | T2: {t2} | SL: {sl} | "
-                    f"⚡ Breakout PRO-FULL (RVOL={rvol:.2f}, RS={rs:.1f}, ATR={atr14:.2f}) "
-                    f"| Qty≈{qty} | Market: {market_bias}"
-                )
-                alerts.append(msg)
-
+            msg = breakout_signal(sym, pivots)
+            if msg:
+                # chống lặp trong ngày
+                today = datetime.now(tz=TZ).strftime("%Y-%m-%d")
+                if sent_today.get(sym) != today:
+                    telegram_send(msg)
+                    sent_today[sym] = today
+                results["signals"].append(msg)
         except Exception as e:
-            print(f"[{sym}] fetch error:", e)
+            # không làm rơi toàn job
+            results.setdefault("errors", {})[sym] = str(e)
+            continue
+        # nhẹ nhàng với API
+        await asyncio.sleep(0.4)
+    return results
 
-    return alerts
 
-# ================== ENDPOINTS ==================
-@app.get("/healthz")
-async def healthz():
-    return {"status": "ok", "service": "vn21-scanner-pro-full"}
+# =========================
+# Schedules (trading hours VN)
+# =========================
+scheduler = AsyncIOScheduler(timezone=str(TZ))
 
-@app.get("/")
-async def root():
+def add_trading_windows():
+    """
+    Chạy mỗi SCAN_INTERVAL_SEC trong 2 phiên:
+      Sáng: 09:00–11:30
+      Chiều: 13:00–15:00
+    T2–T6.
+    """
+    step = max(SCAN_INTERVAL_SEC, 30)
+    # buổi sáng
+    scheduler.add_job(
+        scan_once,
+        CronTrigger(day_of_week="mon-fri", hour="9-11", minute=f"*/{max(step//60,1)}", second="0"),
+        name="morning-scan",
+        misfire_grace_time=60,
+    )
+    # buổi chiều
+    scheduler.add_job(
+        scan_once,
+        CronTrigger(day_of_week="mon-fri", hour="13-15", minute=f"*/{max(step//60,1)}", second="0"),
+        name="afternoon-scan",
+        misfire_grace_time=60,
+    )
+
+add_trading_windows()
+scheduler.start()
+
+
+# =========================
+# FastAPI endpoints
+# =========================
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return "VN21-scanner running. See /healthz, /config, /scan."
+
+# UptimeRobot dùng HEAD → trả 200 OK
+@app.head("/healthz", response_class=PlainTextResponse)
+def healthz_head():
+    return Response(status_code=200)
+
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz():
+    return "OK"
+
+@app.get("/config", response_class=JSONResponse)
+def get_config():
     return {
-        "message": "VN21 Scanner PRO-FULL is running 🚀",
-        "endpoints": ["/healthz", "/update", "/notify", "/plan", "/pivots", "/env-check", "/summary"],
+        "tickers": TICKERS,
+        "pivots": PIVOTS,
+        "plan": PLAN,
+        "interval_sec": SCAN_INTERVAL_SEC,
+        "tz": "Asia/Ho_Chi_Minh",
+        "trading_min_per_day": TRADING_MIN_PER_DAY,
     }
 
-@app.get("/plan")
-async def get_plan():
-    return PLAN
+@app.post("/scan", response_class=JSONResponse)
+async def scan_now():
+    res = await scan_once()
+    return res
 
-@app.post("/plan")
-async def set_plan(payload: Dict[str, Any] = Body(...)):
-    global PLAN
-    if not isinstance(payload, dict):
-        raise HTTPException(400, "Body must be a JSON object (symbol -> config).")
-    PLAN = payload
-    return {"ok": True, "size": len(PLAN)}
 
-@app.get("/pivots")
-async def get_pivots():
-    return PIVOTS
-
-@app.post("/pivots")
-async def set_pivots(payload: Dict[str, float] = Body(...)):
-    global PIVOTS
-    PIVOTS = {k.upper(): float(v) for k, v in payload.items()}
-    return {"ok": True, "size": len(PIVOTS)}
-
-@app.get("/notify")
-async def notify(text: str):
-    r = tg_send(text)
-    return {"ok": bool(r), "preview": text[:120]}
-
-@app.post("/update")
-async def update(background_tasks: BackgroundTasks, symbols: Optional[List[str]] = Body(default=None)):
-    syms = symbols or sorted(set(list(PLAN.keys()) + list(PIVOTS.keys())))
-    syms = [s.upper() for s in syms]
-
-    def _run_and_push():
-        global latest_alerts
-        alerts = scan_symbols(syms)
-        latest_alerts = alerts
-        if not alerts:
-            tg_send("✅ Scanner chạy xong: chưa có tín hiệu mới.")
-        else:
-            for a in alerts:
-                tg_send(format_signal(a.split(" – ")[0], a))
-
-    background_tasks.add_task(_run_and_push)
-    return {"queued": True, "symbols": syms}
-
-@app.get("/env-check")
-async def env_check():
-    return {
-        "bot_token": BOT_TOKEN[:10] + "...",
-        "chat_id": CHAT_ID,
-        "plan_size": len(PLAN),
-        "pivots_size": len(PIVOTS),
-        "resolution": RESOLUTION,
-    }
-
-@app.get("/summary")
-async def summary():
-    return {"latest_alerts": latest_alerts}
+# (Tùy chọn) chạy cục bộ: python app.py
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
