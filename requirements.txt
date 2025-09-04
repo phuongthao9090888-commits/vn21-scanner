@@ -1,22 +1,17 @@
-# --- build toolchain (fix metadata / wheel build) ---
 pip==24.2
-setuptools==69.5.1
+setuptools==70.0.0
 wheel==0.43.0
 
-# --- web / scheduler / utils ---
 fastapi==0.111.0
-uvicorn==0.30.0          # không dùng [standard] để tránh build extras
-httptools==0.6.1
-websockets==12.0
-uvloop==0.19.0; platform_system!="Windows"
-watchfiles==0.21.0
-
+uvicorn==0.30.0        # KHÔNG dùng [standard]
 requests==2.32.3
-apscheduler==3.10.4
+
+# data stack: dùng bản có wheels cho py3.11 trên manylinux
+pandas==2.2.2
+numpy==1.26.4
 pytz==2024.1
 
-# --- data stack ---
-pandas==2.0.3
-numpy==1.26.4
-
-# (tạm thời bỏ gspread/google-auth để loại trừ nguồn lỗi; thêm lại sau khi ổn)
+apscheduler==3.10.4
+gspread==6.1.2
+google-auth==2.33.0
+google-auth-oauthlib==1.2.1
