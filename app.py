@@ -1,23 +1,29 @@
-# app.py — Web service + khởi động scanner ở background
+# app.py — Web service + nền chạy scanner (fixed HEAD 405)
+
 import threading
-from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse, JSONResponse
-from scanner import run_scanner  # toàn bộ logic nằm ở scanner.py
+from fastapi import FastAPI, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+from scanner import run_scanner
 
 app = FastAPI()
 
-# healthz: hỗ trợ cả GET và HEAD để tránh 405 từ UptimeRobot
-@app.get("/healthz")
-def healthz_get():
-    return JSONResponse({"ok": True})
+# Middleware để chuyển HEAD -> GET (tránh 405 Method Not Allowed)
+class HeadToGetMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        if request.method == "HEAD":
+            request.scope["method"] = "GET"
+        return await call_next(request)
 
-@app.head("/healthz")
-def healthz_head():
-    # Trả rỗng + 200 OK cho HEAD
-    return PlainTextResponse("", status_code=200)
+app.add_middleware(HeadToGetMiddleware)
+
+# Health check chấp nhận cả GET và HEAD
+@app.api_route("/healthz", methods=["GET", "HEAD"])
+def healthz():
+    return Response(content='{"ok": true}', media_type="application/json")
 
 # chạy scanner ở background khi web khởi động
 _started = False
+
 @app.on_event("startup")
 def start_bg():
     global _started
