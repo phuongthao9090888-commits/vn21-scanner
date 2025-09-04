@@ -1,10 +1,9 @@
-
-gspread
-google-auth
-google-auth-oauthlib
-apscheduler
 fastapi==0.111.0
 uvicorn[standard]==0.30.0
 requests==2.32.3
 pandas==2.2.2
 numpy==1.26.4
+apscheduler==3.10.4
+gspread==6.1.2
+google-auth==2.33.0
+google-auth-oauthlib==1.2.1
