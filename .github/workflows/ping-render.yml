@@ -1,0 +1,23 @@
+name: Keep Render Awake (VN trading hours)
+
+on:
+  workflow_dispatch: {}   # Cho phép chạy tay
+  schedule:
+    # Sáng: 08:55–11:35 VN  => 01:55–04:35 UTC
+    - cron: "*/5 1-3 * * 1-5"                # 01:00–03:59 UTC mỗi 5'
+    - cron: "0,5,10,15,20,25,30,35 4 * * 1-5" # 04:00–04:35 UTC
+    # Chiều: 12:55–15:05 VN => 05:55–08:05 UTC
+    - cron: "55 5 * * 1-5"                   # 05:55 UTC
+    - cron: "*/5 6-7 * * 1-5"                # 06:00–07:59 UTC mỗi 5'
+    - cron: "0,5 8 * * 1-5"                  # 08:00 & 08:05 UTC
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          set -e
+          URL="https://vn21-scanner.onrender.com/healthz"
+          echo "Pinging $URL ..."
+          curl -fsS "$URL" || exit 1
