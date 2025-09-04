@@ -1,13 +1,20 @@
-# app.py — Web service + nền chạy scanner
+# app.py — Web service + khởi động scanner ở background
 import threading
 from fastapi import FastAPI
-from scanner import run_scanner
+from fastapi.responses import PlainTextResponse, JSONResponse
+from scanner import run_scanner  # toàn bộ logic nằm ở scanner.py
 
 app = FastAPI()
 
+# healthz: hỗ trợ cả GET và HEAD để tránh 405 từ UptimeRobot
 @app.get("/healthz")
-def healthz():
-    return {"ok": True}
+def healthz_get():
+    return JSONResponse({"ok": True})
+
+@app.head("/healthz")
+def healthz_head():
+    # Trả rỗng + 200 OK cho HEAD
+    return PlainTextResponse("", status_code=200)
 
 # chạy scanner ở background khi web khởi động
 _started = False
