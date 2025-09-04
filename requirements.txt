@@ -3,15 +3,8 @@ setuptools==70.0.0
 wheel==0.43.0
 
 fastapi==0.111.0
-uvicorn==0.30.0        # KHÔNG dùng [standard]
+uvicorn==0.30.0
 requests==2.32.3
-
-# data stack: dùng bản có wheels cho py3.11 trên manylinux
 pandas==2.2.2
 numpy==1.26.4
 pytz==2024.1
-
-apscheduler==3.10.4
-gspread==6.1.2
-google-auth==2.33.0
-google-auth-oauthlib==1.2.1
