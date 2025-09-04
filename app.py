@@ -1,3 +1,10 @@
+from fastapi import FastAPI, Response
+
+app = FastAPI()
+
+@app.api_route("/healthz", methods=["GET", "HEAD"])
+def healthz():
+    return Response(content="ok", media_type="text/plain")
 # app.py
 # VN21 Scanner – unified app (Parts 1–40 merged)
 # FastAPI service + scheduler + Telegram + real-time scanner skeleton
