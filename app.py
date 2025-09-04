@@ -1,12 +1,20 @@
-# ---- Health endpoints (accept GET & HEAD) ----
-from fastapi import Response
+# app.py — Web service + nền chạy scanner
+import threading
+from fastapi import FastAPI
+from scanner import run_scanner
 
-@app.api_route("/healthz", methods=["GET", "HEAD"])
+app = FastAPI()
+
+@app.get("/healthz")
 def healthz():
-    # Trả về 200 cho cả GET/HEAD, không body với HEAD theo chuẩn HTTP
-    return Response(content="OK", media_type="text/plain")
+    return {"ok": True}
 
-# (tuỳ chọn) root cũng chấp nhận HEAD để ping thoải mái
-@app.api_route("/", methods=["GET", "HEAD"])
-def root():
-    return Response(content="alive", media_type="text/plain")
+# chạy scanner ở background khi web khởi động
+_started = False
+@app.on_event("startup")
+def start_bg():
+    global _started
+    if not _started:
+        th = threading.Thread(target=run_scanner, daemon=True)
+        th.start()
+        _started = True
