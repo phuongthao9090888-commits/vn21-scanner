@@ -1,13 +1,27 @@
-# app.py
-from fastapi import FastAPI
-import datetime as dt
+# app.py — Web service + khởi động scanner
+import threading
+from fastapi import FastAPI, Response
+from scanner import run_scanner
 
-app = FastAPI(title="VN21 Scanner")
+app = FastAPI()
 
+# Healthcheck: hỗ trợ cả GET và HEAD
+@app.api_route("/healthz", methods=["GET", "HEAD"])
+def healthz():
+    # HEAD không cần body -> trả 200 rỗng
+    return Response(content=b'{"ok": true}', media_type="application/json")
+
+# (tuỳ chọn) thêm root cho dễ test trên trình duyệt
 @app.get("/")
 def root():
-    return {"service": "vn21-scanner", "status": "running"}
+    return {"service": "vn21-scanner", "status": "ok"}
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "time_utc": dt.datetime.utcnow().isoformat() + "Z"}
+# chạy scanner ở background khi web khởi động
+_started = False
+@app.on_event("startup")
+def start_bg():
+    global _started
+    if not _started:
+        th = threading.Thread(target=run_scanner, daemon=True)
+        th.start()
+        _started = True
