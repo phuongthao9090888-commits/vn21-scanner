@@ -1,18 +1,12 @@
-from fastapi import FastAPI
-import uvicorn
+# ---- Health endpoints (accept GET & HEAD) ----
+from fastapi import Response
 
-app = FastAPI()
-
-# Health check endpoint: hỗ trợ cả GET và HEAD
-@app.get("/healthz")
-@app.head("/healthz")
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 def healthz():
-    return {"status": "ok"}
+    # Trả về 200 cho cả GET/HEAD, không body với HEAD theo chuẩn HTTP
+    return Response(content="OK", media_type="text/plain")
 
-# ==== Các phần logic chính của bot ====
-# (scanner, breakout detection, volume filter, Darvas, CANSLIM, Zanger, Telegram push…)
-# Bạn giữ nguyên code phân tích của mình ở dưới đây
-# chỉ cần chắc chắn KHÔNG xoá đoạn healthz phía trên.
-
-if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000)
+# (tuỳ chọn) root cũng chấp nhận HEAD để ping thoải mái
+@app.api_route("/", methods=["GET", "HEAD"])
+def root():
+    return Response(content="alive", media_type="text/plain")
