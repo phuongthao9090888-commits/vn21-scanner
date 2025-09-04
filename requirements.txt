@@ -1,3 +1,6 @@
-requests
 fastapi
 uvicorn
+requests
+gspread
+google-auth
+google-auth-oauthlib
