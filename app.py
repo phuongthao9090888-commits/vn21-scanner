@@ -1,403 +1,332 @@
-# app.py — VN21 Scanner (Pro/Full)
-# - VNDirect DChart (5m + Daily)
-# - Breakout mạnh (pivot, vol, wick)
-# - Darvas Box / MA trend / ATR-lite
-# - Ưu tiên VN21 (danh mục hiện có)
-# - Đề xuất Thay thế/Bổ sung dựa trên điểm số (RS, Trend, Breakout, Risk)
-# - Telegram cảnh báo (đã nhúng sẵn TOKEN/CHAT_ID)
-# - Scheduler quét trong giờ giao dịch, /scan để quét tay, /config để xem cấu hình
+# app.py  — VN21 Scanner (FastAPI + APScheduler + VNDirect)
+# Author: VN21
+# -*- coding: utf-8 -*-
 
-import os, json, math, asyncio, requests
-import pandas as pd
+import os
+import time
+import math
+import json
+import hashlib
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+
+import requests
 import numpy as np
-from typing import Dict, Any, List, Optional
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse, JSONResponse
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import pandas as pd
+from fastapi import FastAPI, Response
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+import pytz
 
-# =========================
-# CẤU HÌNH CỐ ĐỊNH (đã nhét)
-# =========================
-TZ = ZoneInfo("Asia/Ho_Chi_Minh")
-DCHART_URL = "https://dchart-api.vndirect.com.vn/dchart/history"
+# ==========
+# Config
+# ==========
 
-TOKEN = "8207349630:AAFQ1Sq8eumEtNoNNSg4DboQ-SMzBLui95o"
-CHAT_ID = "5614513021"
+# Telegram (có thể override bằng ENV; default dùng thông tin bạn đã cấp)
+TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "8207349630:AAFQ1Sq8eumEtNoNNSg4DboQ-SMzBLui95o")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "5614513021")
 
-# Danh mục VN21 (ưu tiên theo dõi/giữ)
-VN21_CORE = [
+# VN21 (ưu tiên theo dõi/giữ)
+VN21_CORE: List[str] = [
     "VPB","MBB","TCB","CTG","DCM","KDH",
     "HPG","VHM","VIX","DDV","BSR","POW",
     "REE","GMD","VNM","MWG"
 ]
 
-# Universe mở rộng (loại VCB, GAS theo yêu cầu trước)
-UNIVERSE_EXTRA = [
-    # Bank
-    "BID","STB","SHB","ACB","TPB","EIB","LPB","HDB",
+# Universe mở rộng (mid/large cap). Penny sẽ lọc ở runtime.
+UNIVERSE_EXTRA: List[str] = [
+    # Ngân hàng
+    "BID","VCB","STB","ACB","TPB","EIB","LPB","HDB",
     # Chứng khoán
-    "SSI","HCM","VND","VIX","SHS","MBS",
-    # Dầu khí
-    "PVD","PVS","BSR","PLX","POW","PVG",
-    # BĐS/ KCN
-    "KDH","VHM","GEX","KBC","NLG","DXG",
-    # Thép/ VLXD
+    "SSI","HCM","VND","VIX","SHS","MBS","FTS",
+    # Dầu khí / Điện
+    "PVD","PVS","BSR","PLX","GAS","POW","PPC",
+    # BĐS/KCN
+    "VHM","VIC","VRE","KDH","NLG","KBC","GEX","DXG",
+    # Thép / VLXD
     "HPG","HSG","NKG","KSB",
-    # Công nghệ/tiêu dùng
-    "FPT","MWG","VNM","MSN","SAB","DGW","FRT",
-    # Khác vốn hóa lớn
-    "VIC","VGI","REE","GMD","GVR","VTP","LTG","PAN"
+    # Tiêu dùng / Công nghệ / Bán lẻ
+    "VNM","MSN","SAB","FPT","MWG","DGW","FRT",
+    # Hạ tầng / CN
+    "REE","GMD","GVR","VTP","VGI","LTG","PAN"
 ]
 
-DEFAULT_TICKERS = sorted(list(set(VN21_CORE + UNIVERSE_EXTRA)))
+DEFAULT_TICKERS: List[str] = sorted(list(set(VN21_CORE + UNIVERSE_EXTRA)))
 
-# Pivot tay ưu tiên (VN21); mã khác dùng Darvas
+# Pivots tay cho VN21; mã khác dùng Darvas/ATR fallback
 PIVOTS: Dict[str, float] = {
     "VPB":35.4,"MBB":28.2,"TCB":40.1,"CTG":52.5,"DCM":40.0,"KDH":36.5,
     "HPG":29.5,"VHM":106.0,"VIX":38.5,"DDV":31.5,"BSR":27.5,"POW":16.5,
     "REE":65.5,"GMD":70.0,"VNM":62.5,"MWG":80.0
 }
 
-# Plan (target/SL) nếu có; không có thì auto từ pivot (%)
-PLAN: Dict[str, Dict[str, float]] = {
-    # ví dụ:
-    # "POW":{"t1":17.0,"t2":17.6,"sl":15.9}
-}
+# Penny filter (theo giá hiện tại)
+MIN_PRICE = 10.0
 
-# Thời gian & lịch
-SCAN_INTERVAL_SEC = 60              # mỗi phút quét 1 lần
-TRADING_MIN_PER_DAY = 270           # 9:00–11:30, 13:00–15:00 (VN)
-TRADING_WINDOWS = [("09:00","11:30"), ("13:00","15:00")]
+# Breakout params
+WICK_RATIO_LIMIT = 0.60      # upper wick <= 60% thân nến
+VOL_RATIO_BREAK = 1.5        # vol/ phút >= 1.5× avg
+CLOSE_PCT_FORCE = 0.01       # >+1% trên pivot
+SUPPORT_BAND = 0.02          # ~ 2% dưới pivot
 
-# Chống spam
-sent_today: Dict[str, str] = {}     # {sym: "YYYY-MM-DD"}
-cooldown_ts: Dict[str, float] = {}  # {sym: unix}  — 600s
+TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 
-# =========================
-# FastAPI
-# =========================
-app = FastAPI(title="VN21 Scanner Pro/Full", version="3.0")
-
-# =========================
+# ==========
 # Utils
-# =========================
-def now_ts() -> int:
-    return int(datetime.now(tz=TZ).timestamp())
+# ==========
 
-def fmt_hm(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=TZ).strftime("%H:%M")
+def now_vn() -> datetime:
+    return datetime.now(TZ)
 
-def tele_send(text: str):
+def tstamp() -> int:
+    return int(time.time())
+
+def telegram_send(text: str) -> None:
     try:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": text}, timeout=10)
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        logging.exception(f"Telegram error: {e}")
+
+def fmt_price(x: Optional[float]) -> str:
+    return "-" if x is None else (f"{x:.2f}".rstrip("0").rstrip("."))
+
+def in_trading_session(dt: Optional[datetime] = None) -> bool:
+    """08:55–11:35 & 12:55–15:05 VN time"""
+    dt = dt or now_vn()
+    hm = dt.hour * 60 + dt.minute
+    am_open, am_close = 8*60+55, 11*60+35
+    pm_open, pm_close = 12*60+55, 15*60+5
+    return (am_open <= hm <= am_close) or (pm_open <= hm <= pm_close)
+
+# ==========
+# VNDirect fetchers
+# ==========
+
+def fetch_5m_candles(symbol: str, nbars: int = 120) -> Optional[pd.DataFrame]:
+    """
+    Lấy nến 5' gần nhất từ VNDirect dchart API
+    """
+    try:
+        to_ts   = tstamp()
+        frm_ts  = to_ts - 60*60*24*7   # 7 ngày ~ đủ cho 120 nến
+        url = "https://dchart-api.vndirect.com.vn/dchart/history"
+        params = {"symbol": symbol, "resolution": "5", "from": frm_ts, "to": to_ts}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if not data or "t" not in data:
+            return None
+        df = pd.DataFrame({
+            "ts": data["t"],
+            "open": data.get("o", []),
+            "high": data.get("h", []),
+            "low":  data.get("l", []),
+            "close":data.get("c", []),
+            "volume": data.get("v", []),
+        })
+        df["dt"] = pd.to_datetime(df["ts"], unit="s").dt.tz_localize("UTC").dt.tz_convert(TZ)
+        df = df.dropna().tail(nbars).reset_index(drop=True)
+        return df
+    except Exception as e:
+        logging.exception(f"fetch_5m_candles({symbol}) failed: {e}")
+        return None
+
+def last_traded_price(df: pd.DataFrame) -> Optional[float]:
+    try:
+        return float(df["close"].iloc[-1])
     except Exception:
-        pass
+        return None
 
-def get_plan(sym: str, ref: float) -> Dict[str, float]:
-    p = PLAN.get(sym, {})
-    if {"t1","t2","sl"} <= set(p):
-        return {"t1": float(p["t1"]), "t2": float(p["t2"]), "sl": float(p["sl"])}
-    base = PIVOTS.get(sym, ref)
-    return {"t1": round(base*1.03,2), "t2": round(base*1.06,2), "sl": round(base*0.97,2)}
+# ==========
+# Pivot engines (Darvas/ATR fallback)
+# ==========
 
-def in_trading_hours() -> bool:
-    now = datetime.now(tz=TZ)
-    if now.weekday() >= 5:  # T7-CN
-        return False
-    hm = now.strftime("%H:%M")
-    for a,b in TRADING_WINDOWS:
-        if a <= hm <= b:
-            return True
-    return False
+def atr(df: pd.DataFrame, period: int = 14) -> float:
+    h, l, c = df["high"].values, df["low"].values, df["close"].shift(1).fillna(df["close"]).values
+    tr = np.maximum(h-l, np.maximum(np.abs(h-c), np.abs(l-c)))
+    return float(pd.Series(tr).rolling(period).mean().iloc[-1])
 
-# =========================
-# Data fetchers
-# =========================
-def fetch_dchart(symbol: str, resolution: str, days: int) -> pd.DataFrame:
-    to_ts = now_ts()
-    params = {"symbol": symbol, "resolution": resolution, "from": to_ts - days*86400, "to": to_ts}
-    r = requests.get(DCHART_URL, params=params, timeout=15)
-    r.raise_for_status()
-    js = r.json()
-    if not js or "t" not in js or not js["t"]:
-        return pd.DataFrame()
-    df = pd.DataFrame({"t": js["t"], "o": js["o"], "h": js["h"], "l": js["l"], "c": js["c"], "v": js["v"]})
-    return df
+def darvas_pivot(df: pd.DataFrame) -> Optional[float]:
+    """Lấy swing high gần nhất như 1 pivot box top"""
+    try:
+        highs = df["high"]
+        # Đi tìm local maxima (tam giác 5 nến)
+        for i in range(len(highs)-6, 5, -1):
+            window = highs[i-3:i+3]
+            if highs.iloc[i] == window.max():
+                return float(highs.iloc[i])
+        return float(highs.iloc[-20:].max())
+    except Exception:
+        return None
 
-def fetch_5m(symbol: str, days: int = 5) -> pd.DataFrame:
-    return fetch_dchart(symbol, "5", days)
+def get_pivot(symbol: str, df: pd.DataFrame) -> Optional[float]:
+    if symbol in PIVOTS:
+        return PIVOTS[symbol]
+    pv = darvas_pivot(df)
+    if pv is None:
+        return None
+    # tinh chỉnh bằng ATR nhỏ
+    _atr = atr(df, 14)
+    return round(pv, 2) if _atr is None else round(pv, 2)
 
-def fetch_daily(symbol: str, days: int = 140) -> pd.DataFrame:
-    return fetch_dchart(symbol, "D", days)
+# ==========
+# Pattern / Volume logic
+# ==========
 
-# =========================
-# Indicators / helpers
-# =========================
-def wick_ok(o, h, l, c) -> bool:
+def upper_wick_ratio(o: float, h: float, l: float, c: float) -> float:
     body = abs(c - o)
-    upper = h - max(o, c)
-    if body < 1e-4:
-        return upper <= 0.002 * c
-    return upper <= 0.6 * body
+    if body <= 1e-6:
+        return 1.0  # coi như wick dài
+    wick_up = max(0.0, h - max(o, c))
+    return wick_up / body
 
-def avg_per_minute_volume_20d(symbol: str) -> Optional[float]:
-    dfd = fetch_daily(symbol, 60)
-    if dfd.empty: return None
-    dfd = dfd.tail(20)
-    if dfd.empty: return None
-    avg_daily = float(pd.to_numeric(dfd["v"], errors="coerce").dropna().mean())
-    if avg_daily <= 0: return None
-    return avg_daily / TRADING_MIN_PER_DAY
+def bearish_reversal(o: float, h: float, l: float, c: float, prev_o: float, prev_c: float) -> bool:
+    # Shooting star: wick trên dài & close < open
+    shoot = (upper_wick_ratio(o, h, l, c) > 0.8) and (c < o)
+    # Bearish engulfing
+    engulf = (c < o) and (prev_c > prev_o) and (o >= prev_c) and (c <= prev_o)
+    return shoot or engulf
 
-def darvas_box(df5: pd.DataFrame, lookback=60) -> Optional[Dict[str,float]]:
-    if df5.empty: return None
-    seg = df5.tail(lookback)
-    hi = float(seg["h"].max()); lo = float(seg["l"].min())
-    if math.isfinite(hi) and math.isfinite(lo) and hi > lo:
-        return {"top": round(hi,2), "bot": round(lo,2)}
+def vol_per_min(vol_5m: float) -> float:
+    return float(vol_5m) / 5.0
+
+# ==========
+# Core signal
+# ==========
+
+def analyze_symbol(symbol: str) -> Optional[str]:
+    df = fetch_5m_candles(symbol)
+    if df is None or len(df) < 25:
+        return None
+
+    last = last_traded_price(df)
+    if last is None or last < MIN_PRICE:   # bỏ penny theo runtime
+        return None
+
+    # Vol averages
+    vpm = vol_per_min(df["volume"].iloc[-1])
+    vpm_avg = vol_per_min(df["volume"].tail(20).mean())
+
+    # 2 nến gần nhất
+    o1, h1, l1, c1, v1, t1 = df.iloc[-1][["open","high","low","close","volume","dt"]]
+    o2, h2, l2, c2, v2, t2 = df.iloc[-2][["open","high","low","close","volume","dt"]]
+
+    # Pivot
+    pivot = get_pivot(symbol, df)
+    if pivot is None:
+        return None
+
+    # Flags
+    wick_ok = (upper_wick_ratio(o1, h1, l1, c1) <= WICK_RATIO_LIMIT)
+    vol_ok  = (vpm >= VOL_RATIO_BREAK * vpm_avg)
+
+    close_force = (c1 >= pivot * (1 + CLOSE_PCT_FORCE))
+    two_closes  = (c2 >= pivot) and (c1 >= pivot)
+
+    breakout = (wick_ok and vol_ok and (close_force or two_closes))
+
+    # Hỗ trợ vùng mua (giá về gần pivot -2%)
+    support_buy = (pivot * (1 - SUPPORT_BAND) <= c1 < pivot)
+
+    # Cảnh báo rủi ro: nến đảo chiều + vol spike
+    risk = bearish_reversal(o1, h1, l1, c1, o2, c2) and (vpm >= 1.8 * vpm_avg)
+
+    # Targets/SL (đơn giản hóa; nếu có plan riêng thì map từ ENV/Sheets)
+    atr14 = atr(df, 14) or 0.0
+    entry_low  = round(max(pivot, min(c1, o1)) * 0.999, 2)
+    entry_high = round(max(c1, o1), 2)
+    t1 = round(c1 + 1.0 * atr14, 2)
+    t2 = round(c1 + 2.0 * atr14, 2)
+    sl = round(pivot * 0.97, 2)
+
+    model = "Darvas" if symbol not in PIVOTS else "Pivot+CANSLIM"
+
+    # Compose messages
+    if breakout:
+        note = (f"{symbol} – BUY {fmt_price(entry_low)}–{fmt_price(entry_high)} | "
+                f"T1: {fmt_price(t1)} | T2: {fmt_price(t2)} | SL: {fmt_price(sl)} | "
+                f"⚡ Breakout xác nhận (vol {vpm/vpm_avg:.1f}×, {t1 if isinstance(t1,str) else df['dt'].iloc[-1].strftime('%H:%M')}) | "
+                f"Model: {model}")
+        return note
+
+    if support_buy:
+        note = (f"{symbol} – HỖ TRỢ VÙNG MUA quanh {fmt_price(pivot)} "
+                f"(close {fmt_price(c1)} ~ {100*(pivot-c1)/pivot:.1f}% dưới) | "
+                f"Entry: {fmt_price(entry_low)}–{fmt_price(entry_high)} | SL: {fmt_price(sl)} | "
+                f"Model: {model}")
+        return note
+
+    if risk:
+        note = (f"{symbol} – ⚠️ CẢNH BÁO RỦI RO (đảo chiều/vol bất thường: {vpm/vpm_avg:.1f}×) | "
+                f"Close: {fmt_price(c1)} | Pivot: {fmt_price(pivot)} | "
+                f"Xem xét hạ tỷ trọng/đợi xác nhận lại")
+        return note
+
     return None
 
-def rs_rating(price_now: float, df_d: pd.DataFrame) -> float:
-    if df_d is None or len(df_d) < 60: return 0.0
-    base = df_d["c"].iloc[-60]
-    if base <= 0: return 0.0
-    perf_3m = price_now / base - 1.0
-    # VNINDEX performance (proxy 5%)
-    return (perf_3m - 0.05) * 100.0
-
-def ma_align(df_d: pd.DataFrame) -> float:
-    if len(df_d) < 200: return 0.0
-    c = df_d["c"]
-    ma20 = c.rolling(20).mean().iloc[-1]
-    ma50 = c.rolling(50).mean().iloc[-1]
-    ma200 = c.rolling(100).mean().iloc[-1]
-    score = 0.0
-    if c.iloc[-1] > ma20: score += 0.5
-    if ma20 > ma50: score += 0.25
-    if ma50 > ma200: score += 0.25
-    return score  # 0..1
-
-def near_support_zone(c: float, df_d: pd.DataFrame) -> bool:
-    """Về vùng mua hỗ trợ: c gần MA20D (±1.5%) & wick đẹp (dựa 5m nến cuối)."""
-    if len(df_d) < 20: return False
-    ma20 = df_d["c"].rolling(20).mean().iloc[-1]
-    return abs(c/ma20 - 1.0) <= 0.015
-
-# =========================
-# Breakout detection (5m)
-# =========================
-def breakout_5m_msg(sym: str, pivot: float) -> Optional[str]:
-    # dữ liệu 5m
-    df5 = fetch_5m(sym, 3)
-    if df5.empty or len(df5) < 4:
-        return None
-
-    # loại nến đang chạy: lấy 2 nến đã đóng
-    last3 = df5.tail(3)
-    c1, c2 = float(last3.iloc[-3]["c"]), float(last3.iloc[-2]["c"])
-    o2, h2, l2 = float(last3.iloc[-2]["o"]), float(last3.iloc[-2]["h"]), float(last3.iloc[-2]["l"])
-    v2 = float(last3.iloc[-2]["v"])
-    t1, t2 = int(last3.iloc[-3]["t"]), int(last3.iloc[-2]["t"])
-
-    # (1) giá
-    cond_price = (c1 > pivot and c2 > pivot) or (c2 >= pivot * 1.01)
-    # (2) vol
-    apm = avg_per_minute_volume_20d(sym)
-    if apm is None or apm <= 0: return None
-    cond_vol = v2 >= 1.5 * apm * 5
-    # (3) wick
-    cond_wick = wick_ok(o2, h2, l2, c2)
-
-    if not (cond_price and cond_vol and cond_wick):
-        return None
-
-    # Model tagging
-    box = darvas_box(df5, 60)
-    tags = []
-    if box and c2 > box["top"]: tags.append("Darvas")
-    if c2 > pivot * 1.02 and v2 > 1.8 * apm * 5: tags.append("Zanger")
-    if not tags: tags.append("CANSLIM")
-
-    plan = get_plan(sym, c2)
-    entry_low = round(pivot, 2); entry_high = round(c2, 2)
-    msg = (f"{sym} – BUY {entry_low}-{entry_high} | "
-           f"T1: {plan['t1']} | T2: {plan['t2']} | SL: {plan['sl']} | "
-           f"⚡ Breakout xác nhận (vol {int(v2):,}, {fmt_hm(t1)}–{fmt_hm(t2)}) | "
-           f"Model: {'/'.join(tags)}")
-    return msg
-
-# =========================
-# Scoring (để đề xuất Thay thế/Bổ sung)
-# =========================
-def score_symbol(sym: str, pivot: Optional[float]) -> Dict[str, Any]:
-    """
-    Trả về: {"sym","score","reason","state"} — state: breakout/near-support/risk/neutral
-    """
-    out = {"sym": sym, "score": -1e9, "reason": "", "state": "neutral"}
-    try:
-        df_d = fetch_daily(sym, 140)
-        if df_d.empty or len(df_d) < 60: 
-            out["reason"] = "no-data"; return out
-        price = float(df_d["c"].iloc[-1])
-        vol_d = float(df_d["v"].iloc[-1])
-        rs = rs_rating(price, df_d)
-        trend = ma_align(df_d)
-
-        # Trạng thái
-        state = "neutral"
-        if pivot:
-            if price > pivot * 1.01:
-                state = "breakout"
-            elif abs(price/pivot - 1.0) <= 0.01:
-                state = "near-pivot"
-        if near_support_zone(price, df_d):
-            state = "support"
-        # rủi ro nếu < MA50 hoặc biến động cao mà vol giảm
-        ma50 = df_d["c"].rolling(50).mean().iloc[-1]
-        risk_pen = 0.0
-        if price < ma50: 
-            risk_pen += 0.5
-            state = "risk"
-
-        # Điểm breakout readiness (dựa daily)
-        ready = 0.0
-        if pivot:
-            ready = max(0.0, min(1.0, (price/pivot - 0.98)/0.04))  # map 98%..102% pivot -> 0..1
-
-        # Điểm tổng
-        score = 40*max(rs, -50)/100 + 35*trend + 25*ready - 20*risk_pen
-        out.update({
-            "score": round(score, 2),
-            "reason": f"RS={rs:.1f}, Trend={trend:.2f}, Ready={ready:.2f}, RiskPen={risk_pen:.2f}",
-            "state": state,
-            "price": round(price,2),
-            "pivot": pivot if pivot else None
-        })
-        return out
-    except Exception as e:
-        out["reason"] = f"err:{e}"
-        return out
-
-# =========================
-# Scan tổng hợp
-# =========================
-async def scan_all(tickers: List[str]) -> Dict[str, Any]:
-    res: Dict[str, Any] = {"time": datetime.now(tz=TZ).isoformat(), "breakouts": [], "support": [], "risk": [], "suggest": {}}
-
-    # A. Breakout xác nhận (5m)
-    for sym in tickers:
-        pivot = PIVOTS.get(sym)
-        if not pivot: continue
+def scan_all(tickers: List[str]) -> List[str]:
+    msgs = []
+    for s in tickers:
         try:
-            msg = breakout_5m_msg(sym, pivot)
-            if msg:
-                today = datetime.now(tz=TZ).strftime("%Y-%m-%d")
-                # cooldown 10p/mã
-                if sym in cooldown_ts and (now_ts() - cooldown_ts[sym] < 600):
-                    pass
-                else:
-                    cooldown_ts[sym] = now_ts()
-                    if sent_today.get(sym) != today:
-                        tele_send(msg); sent_today[sym] = today
-                res["breakouts"].append(msg)
+            m = analyze_symbol(s)
+            if m:
+                msgs.append(m)
         except Exception as e:
-            res.setdefault("errors", {})[sym] = f"breakout:{e}"
-        await asyncio.sleep(0.3)
+            logging.exception(f"analyze_symbol({s}) failed: {e}")
+    return msgs
 
-    # B. Phân loại hỗ trợ / rủi ro & chấm điểm
-    scores: List[Dict[str, Any]] = []
-    for sym in tickers:
-        sc = score_symbol(sym, PIVOTS.get(sym))
-        scores.append(sc)
-        st = sc["state"]
-        line = f"{sym} @ {sc.get('price')} | {st} | {sc['reason']}"
-        if st == "support": res["support"].append(line)
-        if st == "risk":    res["risk"].append(line)
-        await asyncio.sleep(0.15)
+# ==========
+# FastAPI
+# ==========
 
-    # C. Đề xuất Thay thế/Bổ sung
-    #   - Lấy top trong universe EXTRA (ngoài VN21)
-    core_set = set(VN21_CORE)
-    extra = [x for x in tickers if x not in core_set]
-    sc_map = {s["sym"]: s for s in scores}
-    top_extra = sorted([sc_map[s] for s in extra if sc_map[s]["score"] > -1e8], key=lambda x: x["score"], reverse=True)[:5]
-    core_rank = sorted([sc_map[s] for s in VN21_CORE if s in sc_map and sc_map[s]["score"]>-1e8], key=lambda x: x["score"])
-    suggestions = {"add": [], "replace": []}
+app = FastAPI(title="VN21 Scanner", version="1.0")
 
-    # Bổ sung: lấy ≤3 mã extra có score rất cao (≥ core median + 8)
-    if core_rank:
-        core_scores = [x["score"] for x in core_rank]
-        core_median = np.median(core_scores)
-        for cand in top_extra:
-            if cand["score"] >= core_median + 8:
-                suggestions["add"].append(f"ADD {cand['sym']} (score {cand['score']}) — {cand['reason']}")
+@app.get("/")
+def root():
+    return {"service": "vn21-scanner", "time": now_vn().isoformat()}
 
-        # Thay thế: nếu top_extra > bottom_core + 10 thì đề xuất swap
-        bottom_core = core_rank[0]
-        best_extra = top_extra[0] if top_extra else None
-        if best_extra and best_extra["score"] >= bottom_core["score"] + 10:
-            suggestions["replace"].append(
-                f"REPLACE {bottom_core['sym']} ⟶ {best_extra['sym']} "
-                f"(core {bottom_core['score']} vs extra {best_extra['score']})"
-            )
+@app.get("/healthz")
+def healthz():
+    # Trả 200 cho GET (UptimeRobot), HEAD đã có route riêng
+    return {"status": "ok", "time": now_vn().isoformat()}
 
-    res["suggest"] = suggestions
-    return res
+@app.head("/healthz")
+def healthz_head():
+    # Render/UptimeRobot hay dùng HEAD -> trả 200 OK
+    return Response(status_code=200)
 
-# =========================
-# Scheduler
-# =========================
-def in_windows() -> bool:
-    return in_trading_hours()
+@app.get("/scan")
+def scan_endpoint():
+    msgs = scan_all(DEFAULT_TICKERS)
+    return {"count": len(msgs), "messages": msgs}
 
-scheduler = AsyncIOScheduler(timezone=str(TZ))
-# chạy mỗi phút trong giờ giao dịch
-scheduler.add_job(lambda: asyncio.create_task(scan_all(DEFAULT_TICKERS)),
-                  CronTrigger(day_of_week="mon-fri", hour="9-11,13-15", minute="*", second="0"),
-                  name="vn21-scan")
+# ==========
+# Scheduler (5 phút trong giờ giao dịch VN)
+# ==========
+
+def scheduled_job():
+    try:
+        if not in_trading_session():
+            return
+        msgs = scan_all(DEFAULT_TICKERS)
+        if msgs:
+            # gửi gộp 1 lần cho đỡ spam
+            telegram_send("📈 <b>VN21 – Tín hiệu chiến lược (5’)</b>\n" + "\n".join(msgs))
+    except Exception as e:
+        logging.exception(f"scheduled_job failed: {e}")
+
+scheduler = BackgroundScheduler(timezone=str(TZ))
+# mỗi 5 phút, mọi ngày; bên trong sẽ tự check giờ giao dịch VN
+scheduler.add_job(scheduled_job, CronTrigger.from_crontab("*/5 * * * *"))
 scheduler.start()
 
-# =========================
-# API
-# =========================
-@app.get("/healthz", response_class=PlainTextResponse)
-def healthz():
-    return "OK"
+# ==========
+# Local run (Render dùng Uvicorn qua Procfile)
+# ==========
 
-@app.get("/config", response_class=JSONResponse)
-def cfg():
-    return {
-        "vn21_core": VN21_CORE,
-        "universe": DEFAULT_TICKERS,
-        "pivots": PIVOTS,
-        "plan": PLAN,
-        "interval": SCAN_INTERVAL_SEC
-    }
-
-@app.post("/scan", response_class=JSONResponse)
-async def scan_now():
-    out = await scan_all(DEFAULT_TICKERS)
-    # Gửi gọn summary lên Telegram
-    if out["breakouts"] or out["suggest"]["add"] or out["suggest"]["replace"]:
-        lines = ["📊 VN21 — Tổng hợp:"]
-        if out["breakouts"]:
-            lines += ["⚡ Breakout:", *[f"• {x}" for x in out["breakouts"][:6]]]
-        if out["support"]:
-            lines += ["🟦 Về hỗ trợ:", *[f"• {x}" for x in out["support"][:6]]]
-        if out["risk"]:
-            lines += ["⚠️ Rủi ro:", *[f"• {x}" for x in out["risk"][:4]]]
-        if out["suggest"]["add"] or out["suggest"]["replace"]:
-            lines += ["🧩 Gợi ý danh mục:"]
-            lines += [f"• {x}" for x in out["suggest"]["add"][:3]]
-            lines += [f"• {x}" for x in out["suggest"]["replace"][:2]]
-        tele_send("\n".join(lines))
-    return out
-
-@app.get("/", response_class=PlainTextResponse)
-def root():
-    return "VN21 Scanner Pro/Full — /healthz /config /scan"
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
