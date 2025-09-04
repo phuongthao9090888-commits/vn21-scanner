@@ -1,4 +1,4 @@
-# app.py
+# scanner.py
 # VN21 Scanner – unified app (Parts 1–40 merged)
 # FastAPI service + scheduler + Telegram + real-time scanner skeleton
 
