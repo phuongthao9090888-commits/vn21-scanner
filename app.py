@@ -263,3 +263,46 @@ def root():
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "time_utc": dt.datetime.utcnow().isoformat() + "Z"}
+# ==== Scheduler cho phiên VN ====
+from apscheduler.schedulers.background import BackgroundScheduler
+import datetime as dt
+
+TZ = dt.timezone(dt.timedelta(hours=7))  # VN time
+
+def during_session(t: dt.datetime):
+    # 09:00–11:30 & 13:00–15:00, Mon–Fri
+    wd = t.weekday()
+    if wd >= 5: 
+        return False
+    hm = t.hour * 60 + t.minute
+    return (540 <= hm <= 690) or (780 <= hm <= 900)
+
+scheduler = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
+_started = False
+
+def scan_job():
+    now_t = dt.datetime.now(TZ)
+    if not during_session(now_t):
+        return
+    # gọi hàm quét 1 lần (bạn đã có sẵn trong code)
+    # ví dụ nếu bạn tách thành scanner.scan_once():
+    try:
+        from scanner import scan_once
+        scan_once()
+    except Exception as e:
+        print("scan_job error:", e)
+
+@app.on_event("startup")
+def _startup():
+    global _started
+    if _started:
+        return
+    # chạy mỗi 20 giây (đổi bằng ENV POLL_SECONDS nếu bạn muốn)
+    scheduler.add_job(scan_job, "interval", seconds=int(os.getenv("POLL_SECONDS", "20")), id="vn_scan", max_instances=1, coalesce=True)
+    scheduler.start()
+    _started = True
+
+# Healthcheck
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "time": dt.datetime.now(TZ).isoformat()}
