@@ -31,3 +31,6 @@ def start_bg():
         th = threading.Thread(target=run_scanner, daemon=True)
         th.start()
         _started = True
+@app.api_route("/healthz", methods=["GET", "HEAD"])
+async def healthz():
+    return {"ok": True}
