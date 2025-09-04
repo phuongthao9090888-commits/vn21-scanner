@@ -306,3 +306,10 @@ def _startup():
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "time": dt.datetime.now(TZ).isoformat()}
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/healthz")
+def health_check():
+    return {"status": "ok"}
