@@ -1,6 +1,0 @@
-fastapi
-uvicorn[standard]
-requests
-gspread
-google-auth
-google-auth-oauthlib
