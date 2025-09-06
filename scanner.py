@@ -180,17 +180,25 @@ def bearish_reversal_risk(df: pd.DataFrame)->bool:
 # ========== Core scoring ==========
 def score(df: pd.DataFrame, symbol: str, pivot: float)->dict:
     out = {"ok_confirmed":False, "ok_early":False, "why":[], "model_tags":[]}
-    if df is None or df.empty or len(df)<40: out["why"].append("no-data"); return out
+    if df is None or df.empty or len(df) < 40:
+        out["why"].append("no-data")
+        return out
     last, prev = df.iloc[-1], df.iloc[-2]
     price = float(last["close"])
 
     # Liquidity / penny filter
-    if price < MIN_PRICE_NON_PENNY: out["why"].append("penny"); return out
-    if avg_daily_value_vnd(symbol, 20) < MIN_AVG_VALUE_VND: out["why"].append("thin-liquidity"); return out
+    if price < MIN_PRICE_NON_PENNY:
+        out["why"].append("penny")
+        return out
+    if avg_daily_value_vnd(symbol, 20) < MIN_AVG_VALUE_VND:
+        out["why"].append("thin-liquidity")
+        return out
 
     # Pivot level (fallback: darvas)
     level = float(pivot) if (pivot and pivot>0) else (_darvas_box_top(df) or 0.0)
-    if level<=0: out["why"].append("no-pivot"); return out
+    if level <= 0:
+        out["why"].append("no-pivot")
+        return out
 
     # Volume need (5m) from 20D per-minute
     per_min = avg_per_min_volume_20d(symbol)  # shares/min
