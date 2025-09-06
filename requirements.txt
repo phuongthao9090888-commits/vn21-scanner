@@ -1,7 +1,13 @@
-fastapi==0.111.0
-uvicorn[standard]==0.30.0
-requests==2.32.3
-pandas==2.0.3
-numpy==1.24.4
-apscheduler==3.10.4
-wheel
+diff --git a/requirements.txt b/requirements.txt
+index 8f0cf5347ea87cb311d165466e45a6299bce3c8d..60db98a15cfa4ba3b8428cff45e476886b164792 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,7 +1,8 @@
+ fastapi==0.111.0
+ uvicorn[standard]==0.30.0
+ requests==2.32.3
+ pandas==2.0.3
+ numpy==1.24.4
+ apscheduler==3.10.4
+ wheel
++setuptools>=69
