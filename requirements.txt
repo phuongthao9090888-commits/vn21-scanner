@@ -5,3 +5,4 @@ pandas==2.0.3
 numpy==1.24.4
 apscheduler==3.10.4
 wheel
+setuptools>=69; python_version >= "3.12"
